@@ -819,6 +819,10 @@ class LtxTrainerConfig(ConfigBaseModel):
     def _validate_data_dirs_exist(self) -> None:
         """Verify that every directory declared by the training strategy exists under the data root."""
         data_root = Path(self.data.preprocessed_data_root)
+        if (data_root / "meta.json").is_file():
+            # dpl memmapped pack corpus: one flat dir, no per-source subdirs
+            # (see PackedPrecomputedDataset in datasets.py)
+            return
         for dir_name in self.training_strategy.get_data_sources():
             dir_path = data_root / dir_name
             if not dir_path.is_dir():

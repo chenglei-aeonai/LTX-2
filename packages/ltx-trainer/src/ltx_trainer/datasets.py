@@ -307,3 +307,77 @@ class PrecomputedDataset(Dataset):
             data["latents"] = latents
 
         return data
+
+
+class PackedPrecomputedDataset(Dataset):
+    """Reads a dpl-style memmapped pack corpus (data-preprocessing-loop
+    `scripts/run_ltx25.py` output) instead of loose per-clip .pt files.
+
+    Layout: latents.f16 (fixed-shape video latents), emb.f16 + offsets.npy
+    (ragged text embeddings holding only the attention-window rows,
+    right-aligned), pad_video.npy (Gemma pad row used to rebuild the full
+    left-padded context), clip_ids.txt, meta.json. One corpus costs ~10
+    inodes regardless of clip count. Detected by trainer via meta.json in
+    preprocessed_data_root. Video-only: no audio_prompt_embeds (the trainer
+    reads that key with .get()). Values are stored f16 and returned bf16
+    (exact for these magnitudes).
+    """
+
+    def __init__(self, data_root: str, data_sources: dict[str, str] | list[str] | None = None) -> None:
+        import json
+
+        import numpy as np
+
+        super().__init__()
+        self._np = np
+        root = Path(data_root).expanduser().resolve()
+        self.root = root
+        self.meta = json.loads((root / "meta.json").read_text())
+        if self.meta.get("format") != "ltx25":
+            raise ValueError(f"{root}/meta.json is not an ltx25 pack (format={self.meta.get('format')})")
+        sources = PrecomputedDataset._normalize_data_sources(data_sources)
+        unsupported = set(sources) - {"latents", "conditions"}
+        if unsupported:
+            raise ValueError(f"Packed dataset supports latents+conditions only, got {sorted(unsupported)}")
+        self.latents_key = sources.get("latents", "latent_conditions")
+        self.conditions_key = sources.get("conditions", "text_conditions")
+        self.clip_ids = (root / "clip_ids.txt").read_text().split()
+        self.offsets = np.load(root / "offsets.npy")
+        self.pad_row = torch.from_numpy(np.load(root / "pad_video.npy")).to(torch.bfloat16)
+        self.ctx_len = int(self.meta["context_len"])
+        self.lat_shape = tuple(self.meta["shape"])
+        self.lat_meta = self.meta["latent_meta"]
+        self._lat_map = None
+        self._emb_map = None
+
+    def _maps(self):
+        # Lazy per-process init: np.memmap objects must not cross the
+        # dataloader-worker fork boundary.
+        if self._lat_map is None:
+            np = self._np
+            n = len(self.clip_ids)
+            self._lat_map = np.memmap(self.root / "latents.f16", dtype=np.float16,
+                                      mode="r", shape=(n, *self.lat_shape))
+            self._emb_map = np.memmap(self.root / "emb.f16", dtype=np.float16,
+                                      mode="r", shape=(int(self.offsets[-1]), int(self.meta["dim"])))
+        return self._lat_map, self._emb_map
+
+    def __len__(self) -> int:
+        return len(self.clip_ids)
+
+    def __getitem__(self, index: int) -> dict:
+        lat_map, emb_map = self._maps()
+        latents = torch.from_numpy(self._np.array(lat_map[index])).to(torch.bfloat16)
+        rows = torch.from_numpy(
+            self._np.array(emb_map[self.offsets[index]:self.offsets[index + 1]])
+        ).to(torch.bfloat16)
+        n = rows.shape[0]
+        embeds = self.pad_row.expand(self.ctx_len, -1).clone()
+        embeds[self.ctx_len - n:] = rows
+        mask = torch.zeros(self.ctx_len, dtype=torch.int64)
+        mask[self.ctx_len - n:] = 1
+        return {
+            self.latents_key: {"latents": latents, **self.lat_meta},
+            self.conditions_key: {"video_prompt_embeds": embeds, "prompt_attention_mask": mask},
+            "idx": index,
+        }

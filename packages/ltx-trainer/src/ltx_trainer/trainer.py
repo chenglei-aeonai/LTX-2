@@ -35,7 +35,7 @@ from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
-from ltx_trainer.datasets import PrecomputedDataset
+from ltx_trainer.datasets import PackedPrecomputedDataset, PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import (
@@ -678,7 +678,12 @@ class LtxvTrainer:
             # Get data sources from the training strategy
             data_sources = self._config.training_strategy.get_data_sources()
 
-            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
+            data_root = Path(self._config.data.preprocessed_data_root)
+            if (data_root / "meta.json").exists():
+                # dpl memmapped pack corpus (see PackedPrecomputedDataset)
+                self._dataset = PackedPrecomputedDataset(str(data_root), data_sources=data_sources)
+            else:
+                self._dataset = PrecomputedDataset(str(data_root), data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         num_workers = self._config.data.num_dataloader_workers
