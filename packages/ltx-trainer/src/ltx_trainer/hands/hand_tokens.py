@@ -98,23 +98,43 @@ class HandTokenIOEcho(nn.Module):
                              f"repr has {skel_dim // 2}")
         self.register_buffer("l_idx", l_idx.clone(), persistent=False)
         self.register_buffer("r_idx", r_idx.clone(), persistent=False)
-        kinds = sorted({k for k, _, _ in self.structure})
-        self.enc = nn.ModuleDict({k: nn.Sequential(
+        # SLOT-AWARE encoding (2026-08-20, user directive). The original
+        # kind-keyed ModuleDict was completely slot-blind: tokens were
+        # enc(x) + time_embed with NO slot identity before attention, so a
+        # camera-frame wrist and a wrist-frame fingertip that whiten to the
+        # same 3-vector produced bit-identical embeddings entering block 1
+        # (RoPE only disambiguates inside attention). Two changes:
+        #   1. one MLP GROUP per STRUCTURE SEGMENT (s0_pos = camera-frame
+        #      wrist, s1_rot = wrist rot6d, s2_pos = wrist-frame joints for
+        #      v2_abspose) -- the semantic split the shared "pos" MLP
+        #      straddled;
+        #   2. a learned per-slot embedding (n_slots x dim, ZERO-init) added
+        #      after the MLP -- distinguishes every slot incl. the 20 joints
+        #      inside a segment and left vs right hand.
+        # Warm-start continuity: remap_legacy_hand_io() copies the old
+        # shared kind-MLP into every segment of that kind; with slot_emb
+        # zero the forward is then BIT-IDENTICAL to the legacy module.
+        self.seg_keys = [f"s{i}_{k}" for i, (k, _, _) in
+                         enumerate(self.structure)]
+        self.enc = nn.ModuleDict({key: nn.Sequential(
             nn.Linear(_ECHO_UNIT[k], dit_dim), nn.GELU(),
-            nn.Linear(dit_dim, dit_dim)) for k in kinds})
+            nn.Linear(dit_dim, dit_dim))
+            for key, (k, _, _) in zip(self.seg_keys, self.structure)})
         self.head = nn.ModuleDict(
-            {k: nn.Linear(dit_dim, _ECHO_UNIT[k]) for k in kinds})
+            {key: nn.Linear(dit_dim, _ECHO_UNIT[k])
+             for key, (k, _, _) in zip(self.seg_keys, self.structure)})
         for h in self.head.values():
             nn.init.zeros_(h.weight)
             nn.init.zeros_(h.bias)
         self.norm = nn.LayerNorm(dit_dim, elementwise_affine=False)
         self.n_slots_hand = sum(n for _, n, _ in self.structure)
         self.n_slots = 2 * self.n_slots_hand
+        self.slot_emb = nn.Parameter(torch.zeros(self.n_slots, dit_dim))
 
     def _segments(self):
         c = 0
-        for kind, n, d in self.structure:
-            yield kind, slice(c, c + n * d), n, d
+        for key, (kind, n, d) in zip(self.seg_keys, self.structure):
+            yield key, slice(c, c + n * d), n, d
             c += n * d
 
     def tokens(self, skel_noisy: torch.Tensor, t_s: torch.Tensor) -> torch.Tensor:
@@ -124,10 +144,11 @@ class HandTokenIOEcho(nn.Module):
         rows = []
         for idx in (self.l_idx, self.r_idx):
             v = skel_noisy[..., idx]
-            for kind, sl, n, d in self._segments():
+            for key, sl, n, d in self._segments():
                 u = v[..., sl].reshape(B, T, n, d)
-                rows.append(self.enc[kind](u))
+                rows.append(self.enc[key](u))
         emb = torch.cat(rows, dim=2)                          # (B, T, S, dim)
+        emb = emb + self.slot_emb.reshape(1, 1, self.n_slots, -1).to(emb.dtype)
         t_emb = _sinusoidal_time_embed(t_s, emb.shape[-1], out_dtype=emb.dtype)
         emb = emb + t_emb.reshape(B, 1, 1, -1)
         return emb.reshape(B, T * self.n_slots, -1)
@@ -140,12 +161,38 @@ class HandTokenIOEcho(nn.Module):
         s = 0
         for idx in (self.l_idx, self.r_idx):
             hand = hand_hidden.new_zeros(B, T, idx.numel())
-            for kind, sl, n, d in self._segments():
-                y = self.head[kind](hid[:, :, s:s + n])
+            for key, sl, n, d in self._segments():
+                y = self.head[key](hid[:, :, s:s + n])
                 hand[..., sl] = y.reshape(B, T, n * d)
                 s += n
             out[..., idx] = hand
         return out
+
+
+def remap_legacy_hand_io(io_sd: dict, structure) -> dict:
+    """Legacy kind-keyed hand_io state dict -> segment-keyed (2026-08-20).
+
+    Copies the old shared kind MLP ('enc.pos.*', 'head.rot.*', ...) into
+    EVERY segment of that kind ('enc.s0_pos.*', 'enc.s2_pos.*', ...), which
+    together with the zero slot_emb makes the new module's forward
+    bit-identical to the legacy one at load. Already-new dicts pass through
+    unchanged. slot_emb is deliberately NOT synthesized -- load with
+    strict=False and let the zero init stand."""
+    legacy = any(k.startswith(("enc.pos.", "enc.rot.", "head.pos.", "head.rot."))
+                 for k in io_sd)
+    if not legacy:
+        return dict(io_sd)
+    out = {}
+    seg_keys = [f"s{i}_{k}" for i, (k, _, _) in enumerate(structure)]
+    for k, v in io_sd.items():
+        parts = k.split(".")
+        if parts[0] in ("enc", "head") and parts[1] in ("pos", "rot"):
+            for key, (kind, _, _) in zip(seg_keys, structure):
+                if kind == parts[1]:
+                    out[".".join([parts[0], key] + parts[2:])] = v.clone()
+        else:
+            out[k] = v
+    return out
 
 
 class BlockHandQKV(nn.Module):

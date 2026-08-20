@@ -277,6 +277,18 @@ class EvalRenderer:
         # STG (sampler upgrade 2026-08-18): third pass with block-28's
         # self-attention value-passthrough perturbed; ltx defaults
         # video_stg_scale 1.0, stg_blocks [28]. 0 disables.
+        # EVAL_TEACHER_FORCE (ported from wan22 v47, 2026-08-19):
+        # 'noised' = RePaint-style clamp -- each step the video state is
+        # the GT forward-noised at THAT step's sigma (in-distribution by
+        # construction); only the hands genuinely sample. 'clean' holds
+        # the whole GT video clean (label 0) -- off-distribution but
+        # graceful. A measurement control for cross-modal grounding, not
+        # the generative task: deletes video-future multimodality from
+        # the hand metrics. Runs as an EXTRA metrics-only pass (keys
+        # *_tf_mm); the free-running eval and panels are unchanged.
+        _tf = os.environ.get("EVAL_TEACHER_FORCE", "0")
+        self.tf_mode = ({'1': 'clean'}.get(_tf, _tf)
+                        if _tf in ('1', 'clean', 'noised') else None)
         self.stg = float(os.environ.get("EVAL_STG", "1.0"))
         self.stg_blocks = tuple(int(b) for b in os.environ.get(
             "EVAL_STG_BLOCKS", "28").split(",") if b)
@@ -413,6 +425,67 @@ class EvalRenderer:
                 if w.sum() > 0:
                     iv_mpjpe = ((d2 * w).sum() / w.sum()).item() * 1000
                     metrics[f"eval/{key}/mpjpe_inview_mm"] = iv_mpjpe
+
+            # ---- teacher-forced grounding pass (metrics only, no panels) ----
+            # Video clamped to GT (see tf_mode in __init__); CFG/STG only ever
+            # touch the discarded video prediction (s_pred is cond-pass), so
+            # this costs ONE forward per step. Same seed, ladder, anchor.
+            if self.tf_mode is not None:
+                v_free, s_free = v, s      # panels below need the FREE sample
+                g2 = torch.Generator(device=device).manual_seed(
+                    int(os.environ.get("EVAL_SEED", "1")))
+                v2 = torch.randn(v_clean.shape, generator=g2, device=device,
+                                 dtype=torch.float32)
+                s2 = torch.randn((1, T, 138), generator=g2, device=device,
+                                 dtype=torch.float32).to(dtype)
+                s2[:, 0] = anchor
+                eps_v = v2.clone()
+                for i in range(len(sig) - 1):
+                    s_cur, s_next = sig[i], sig[i + 1]
+                    if self.tf_mode == "noised":
+                        v = ((1.0 - s_cur) * v_clean.float()
+                             + s_cur * eps_v).to(dtype)
+                    else:                                    # clean
+                        v = v_clean.clone()
+                    v[:, :n0] = v_clean[:, :n0]
+                    s = s2
+                    s[:, 0] = anchor
+                    ts = torch.full((1, L_v + n_hand), float(s_cur),
+                                    device=device, dtype=dtype)
+                    if self.tf_mode == "clean":
+                        ts[:, :L_v] = 0.0                    # video labeled clean
+                    ts[:, :n0] = 0.0
+                    ts[:, L_v:L_v + n_slots] = 0.0
+                    _, s_pred2 = _fwd(ctx_pos, am_pos)
+                    s2 = s2 + (s_next - s_cur).to(dtype) * s_pred2
+                s2[:, 0] = anchor
+                s2_raw = unwhiten(s2.float().cpu().squeeze(0), self.stats)
+                J2, _ = decode_v2_abspose(s2_raw)
+                mpjpe_tf = (J2[:, :, :n] - Jg[:, :, :n]
+                            ).norm(dim=-1).mean().item() * 1000
+                wrist_tf = (J2[:, :, 0] - Jg[:, :, 0]
+                            ).norm(dim=-1).mean().item() * 1000
+                artic_tf = ((J2[:, :, 1:] - J2[:, :, 0:1])
+                            - (Jg[:, :, 1:] - Jg[:, :, 0:1])
+                            ).norm(dim=-1).mean().item() * 1000
+                metrics[f"eval/{key}/mpjpe_tf_mm"] = mpjpe_tf
+                metrics[f"eval/{key}/wrist_tf_mm"] = wrist_tf
+                metrics[f"eval/{key}/artic_tf_mm"] = artic_tf
+                iv_tf = None
+                if "in_view" in anno:
+                    n_t = min(ivm.shape[0], J2.shape[0], Jg.shape[0])
+                    d2f = (J2[:n_t] - Jg[:n_t]).norm(dim=-1)
+                    w2 = ivm[:n_t].float().unsqueeze(-1).expand_as(d2f)
+                    if w2.sum() > 0:
+                        iv_tf = ((d2f * w2).sum() / w2.sum()).item() * 1000
+                        metrics[f"eval/{key}/mpjpe_inview_tf_mm"] = iv_tf
+                v, s = v_free, s_free      # restore for the panel section
+                if self.is_main:
+                    print(f"[eval {global_step} tf-{self.tf_mode}] {key}: "
+                          f"MPJPE {mpjpe_tf:.0f} mm, wrist {wrist_tf:.0f} mm, "
+                          f"artic {artic_tf:.1f} mm"
+                          + (f", iv-MPJPE {iv_tf:.0f} mm"
+                             if iv_tf is not None else ""), flush=True)
 
             # ---- panels (rank-0 only: no collectives below this point) ----
             if not self.is_main:

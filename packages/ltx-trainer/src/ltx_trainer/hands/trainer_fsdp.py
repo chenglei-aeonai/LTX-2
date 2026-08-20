@@ -45,6 +45,7 @@ from .losses import (
     integrated_motion_loss,
     masked_frame0_flow_loss,
     recover_x0_from_v,
+    reprojection_loss,
 )
 from .representations import unwhiten
 from .trainer import FPS, LTX_MODELS, env, video_positions
@@ -176,14 +177,53 @@ def main():  # noqa: PLR0915
     _out_early = Path(env("OUTPUT_PATH", "outputs/ltx_hands_fsdp"))
     hws = env("HAND_WARM_START", "")
     if hws and not sorted(_out_early.glob("astate_step_*")):
+        from .hand_tokens import remap_legacy_hand_io
         st = torch.load(hws, map_location="cpu", weights_only=False)
-        module.hand_io.load_state_dict(st["hand_io"])
+        miss = module.hand_io.load_state_dict(
+            remap_legacy_hand_io(st["hand_io"], module.hand_io.structure),
+            strict=False)
+        assert set(miss.missing_keys) <= {"slot_emb"}, miss.missing_keys
+        assert not miss.unexpected_keys, miss.unexpected_keys
         hq = {f"{k.split('.')[0]}.hand_qkv.{'.'.join(k.split('.')[1:])}": v
               for k, v in st["hand_attn"].items()}
         module.model.transformer_blocks.load_state_dict(hq, strict=False)
         _warm_step = env("INIT_STEP", "0", int)
         if is_main:
             print(f"[warm-start] {hws} -> hand modules loaded, schedule "
+                  f"position {_warm_step}", flush=True)
+    # FULL_WARM_START (2026-08-20): resume from a CONSOLIDATED full-model
+    # .pt (dcp_to_torch_save of a prior astate) when the astate itself is
+    # no longer loadable -- here, the hand_io slot-aware refactor added
+    # parameters, and accelerate's DCP load has no strict=False. Loads
+    # EVERYTHING (video SFT weights + hand modules) pre-prepare; the
+    # legacy hand_io keys are remapped so the restart is forward-identical
+    # (slot_emb zero). Optimizer moments restart fresh (the established
+    # SGDR-style warm-restart trade); INIT_STEP carries the schedule.
+    fws = env("FULL_WARM_START", "")
+    if fws and not sorted(_out_early.glob("astate_step_*")):
+        from .hand_tokens import remap_legacy_hand_io
+        # mmap: 8 ranks/2 nodes each torch.load'ing a 31.5G dict is 126G of
+        # host pressure per node -- mmap shares the page cache instead.
+        full = torch.load(fws, map_location="cpu", weights_only=False,
+                          mmap=True)
+        sd = full.get("model", full)
+        io_sd = {k[len("hand_io."):]: v for k, v in sd.items()
+                 if k.startswith("hand_io.")}
+        rest = {k: v for k, v in sd.items() if not k.startswith("hand_io.")}
+        io_new = {f"hand_io.{k}": v for k, v in remap_legacy_hand_io(
+            io_sd, module.hand_io.structure).items()}
+        miss = module.load_state_dict({**rest, **io_new}, strict=False)
+        assert set(miss.missing_keys) <= {"hand_io.slot_emb"}, \
+            miss.missing_keys[:8]
+        assert not miss.unexpected_keys, miss.unexpected_keys[:8]
+        _warm_step = env("INIT_STEP", "0", int)
+        n_loaded = len(rest) + len(io_new)
+        del full, sd, io_sd, rest, io_new
+        import gc
+        gc.collect()
+        if is_main:
+            print(f"[full-warm-start] {fws} -> {n_loaded} "
+                  f"tensors loaded (missing only slot_emb), schedule "
                   f"position {_warm_step}", flush=True)
     _te = str(LTX_MODELS / "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors")
     _tr = str(LTX_MODELS / "diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors")
@@ -272,6 +312,19 @@ def main():  # noqa: PLR0915
     lam_vel = env("LAMBDA_INT_VEL", "2e3", float)
     lam_joints = env("LAMBDA_INT_JOINTS", "0.0", float)
     lam_anchor = env("LAMBDA_INT_ANCHOR", "1.0", float)
+    # Reprojection term (2026-08-19): angular error after the perspective
+    # divide, intrinsics-free (see losses.reprojection_loss). Weight derived
+    # from units: theta = e_lat/z, so matching lam_int's gradient on metric
+    # error at typical ego hand depth z~0.45m gives lam_int * z^2 ~ 1e2.
+    # Default 0 -> every existing run's objective is bit-identical.
+    lam_reproj = env("LAMBDA_REPROJ", "0.0", float)
+    # REPROJ_PIXEL=1: measure the residual in train-resolution pixels via the
+    # per-clip focal (batch["focal_px"]) -- inverse-variance weighting for
+    # pixel-derived GT. REPROJ_DELTA is then the Huber knee in PIXELS (the
+    # GT noise floor ~2.5px), else in radians.
+    reproj_pixel = env("REPROJ_PIXEL", "0", bool)
+    reproj_delta = env("REPROJ_DELTA", "2.5" if reproj_pixel else "0.05",
+                       float)
     ff_dropout = env("FIRST_FRAME_DROPOUT", "0.0", float)
     hand_bidir = env("HAND_BIDIR_STAGE3", "1", bool)
     bench_steps = env("BENCH_STEPS", "0", int)
@@ -351,14 +404,26 @@ def main():  # noqa: PLR0915
             s_x0_hat = torch.where(anchored.view(-1, 1, 1) & frame0, s_clean,
                                    s_x0_hat)
         fv = torch.stack([chan_valid[..., 0], chan_valid[..., 3]], dim=-1).bool()
+        s_hat_m, s_tgt_m = unwhiten(s_x0_hat, stats), unwhiten(s_clean, stats)
         anchor, shape, comps = integrated_motion_loss(
-            unwhiten(s_x0_hat, stats), unwhiten(s_clean, stats), mask=None,
+            s_hat_m, s_tgt_m, mask=None,
             sigma=None, version="v2_abspose", frame_valid=fv)
         loss_int = lam_anchor * anchor + shape
         total = (loss_v + lam_s * loss_s + lam_int * loss_int
                  + lam_fing * comps["fing"] + lam_vel * comps["vel"]
                  + lam_joints * comps["joints"])
+        loss_rp = total.new_zeros(())
+        rp_rad = total.new_zeros(())
+        if lam_reproj > 0:
+            loss_rp, rp_diag = reprojection_loss(
+                s_hat_m, s_tgt_m, version="v2_abspose", frame_valid=fv,
+                delta=reproj_delta,
+                focal_px=batch["focal_px"].to(device) if reproj_pixel
+                else None)
+            rp_rad = rp_diag["reproj_rad"]
+            total = total + lam_reproj * loss_rp
         return {"total": total, "loss_v": loss_v, "loss_s": loss_s,
+                "loss_reproj": loss_rp, "reproj_rad": rp_rad,
                 "loss_int": loss_int, "loss_int_anchor": anchor,
                 "loss_int_shape": shape, "loss_int_wrist": comps["wrist"],
                 "loss_int_rot": comps["rot"],

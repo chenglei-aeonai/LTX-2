@@ -125,19 +125,28 @@ class JointHandsModule(torch.nn.Module):
             print(f"AUDIO_PRUNE: dropped {n/1e9:.2f}B audio-stream params "
                   f"({n*2/2**30:.1f} GiB bf16)", flush=True)
 
-        # Video-side LoRA (attention + FF adapters; opened in stages 2/3).
+        # Video-side adapters -- skipped under DIT_TUNE=sft_full (raw-weight
+        # checkpoints; used by render_step_full for SFT-arm rendering).
+        self.dit_tune = env("DIT_TUNE", "lora")
+        if self.dit_tune == "sft_full":
+            for p in self.model.parameters():
+                p.requires_grad = False
+            lora_skipped = True
+        else:
+            lora_skipped = False
         from peft import LoraConfig, get_peft_model
         rank = env("LORA_RANK", "64", int)
-        lora_cfg = LoraConfig(
+        lora_cfg = None if lora_skipped else LoraConfig(
             r=rank, lora_alpha=env("LORA_ALPHA", str(rank), int),
             target_modules=["attn1.to_q", "attn1.to_k", "attn1.to_v",
                             "attn1.to_out.0", "attn2.to_q", "attn2.to_k",
                             "attn2.to_v", "attn2.to_out.0",
                             "ff.net.0.proj", "ff.net.2"],
             init_lora_weights=True)
-        self.model = get_peft_model(self.model, lora_cfg).base_model.model
-        for n, p in self.model.named_parameters():
-            p.requires_grad = "lora_" in n
+        if lora_cfg is not None:
+            self.model = get_peft_model(self.model, lora_cfg).base_model.model
+            for n, p in self.model.named_parameters():
+                p.requires_grad = "lora_" in n
 
         dit_dim = self.model.inner_dim
         self.hand_io = HandTokenIOEcho(skel_dim=138, dit_dim=dit_dim,

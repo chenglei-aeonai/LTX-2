@@ -421,6 +421,89 @@ def integrated_motion_loss(pred_x0: torch.Tensor, target_x0: torch.Tensor,
     return anchor, red(shape_se), comps
 
 
+def reprojection_loss(pred_x0: torch.Tensor, target_x0: torch.Tensor,
+                      version: str = "v2_abspose",
+                      frame_valid: torch.Tensor | None = None,
+                      z_min: float = 0.15, delta: float = 0.05,
+                      focal_px: torch.Tensor | None = None,
+                      ) -> tuple[torch.Tensor, dict]:
+    """Camera-space reprojection error on the composed joints, in NORMALIZED
+    camera coordinates (X/Z, Y/Z) -- i.e. angular units, intrinsics-free.
+
+    pred_x0 / target_x0: (B, T, 138) un-whitened v2 vectors.
+
+    Why normalized coords instead of pixels (2026-08-19, user directive to
+    add a reprojection term): comparing pred vs GT joints after the
+    perspective divide needs NO intrinsics and NO distortion model -- K only
+    maps ray space to pixels, and both sides of the comparison are 3D points
+    in the same camera frame. That sidesteps the per-corpus K/rectification
+    audit entirely (HOT3D is fisheye; ARCTIC's dist8 was historically never
+    applied). The cost: a given angular error means different pixel error
+    across FOVs, which is the principled trade -- angle IS the observable.
+
+    Role in the objective: MPJPE error is dominated by depth along the view
+    ray (the ~90-120 mm trajectory-ambiguity floor), which a monocular ego
+    view cannot observe. loss_int prices that unobservable axis at full
+    weight; this term is its complement -- it drops the ray component and
+    concentrates gradient on lateral placement, the thing the overlay
+    actually shows. It must COEXIST with loss_int (the metric anchor),
+    never replace it, or the model can trade depth for 2D fit.
+
+    Stability (the perspective divide is the hazard): x0-hat recovered at
+    high sigma is mostly noise, so pred Z can approach 0 or go negative.
+    Both Z's are clamped to `z_min` metres; cells whose GT Z <= z_min are
+    EXCLUDED (a GT hand at/behind the camera plane has no defined
+    projection); per-component Huber with knee `delta` (rad; 0.05 rad ~=
+    2.9 deg ~= 2.2 cm lateral at 0.45 m) keeps the linear tail from letting
+    early-training outliers dominate. No sigma reweighting, matching how
+    this trainer calls integrated_motion_loss under SKEL_PRED=v (x0 = noise
+    - v_hat has no 1/(1-sigma) amplification to cancel).
+
+    `frame_valid`: (B, T, 2) bool per-(frame, hand) annotation validity,
+    same convention as integrated_motion_loss.
+
+    Returns (loss, diag): scalar Huber loss over valid cells, and
+    diag["reproj_rad"] = mean angular error in radians over the quadratic
+    zone's definition (plain L2 of the uv residual), for logging.
+    """
+    from .representations import get_repr
+
+    p_j, _ = get_repr(version).integrate(pred_x0)        # (B, T, 2, 20, 3)
+    t_j, _ = get_repr(version).integrate(target_x0)
+    p_j, t_j = p_j.float(), t_j.float()
+
+    t_z = t_j[..., 2]
+    valid = t_z > z_min                                  # (B, T, 2, 20)
+    if frame_valid is not None:
+        valid = valid & frame_valid.to(valid.device).bool().unsqueeze(-1)
+
+    p_uv = p_j[..., :2] / p_j[..., 2:3].clamp(min=z_min)
+    t_uv = t_j[..., :2] / t_z.clamp(min=z_min).unsqueeze(-1)
+    d = p_uv - t_uv                                      # (B, T, 2, 20, 2)
+
+    # PIXEL MODE (2026-08-19, user directive): scale the residual by the
+    # per-clip focal at TRAIN resolution -> the residual and `delta` are in
+    # pixels of the 832x480 frame. Rationale (user): pixel-derived GT has
+    # ~constant PIXEL noise, so pixel space is the inverse-variance-correct
+    # weighting -- long-lens corpora (angularly more precise GT) are priced
+    # more, far hands (metrically less certain GT) less. The principal
+    # point cancels in the difference, so focal alone suffices. Caveat
+    # (documented in the experiment md): ARCTIC/HOT3D GT is marker mocap
+    # (metric-constant noise); loss_int stays the noise-matched term there.
+    if focal_px is not None:
+        d = d * focal_px.to(d.device, d.dtype).view(-1, 1, 1, 1, 2)
+
+    ad = d.abs()
+    hub = torch.where(ad <= delta, 0.5 * d.pow(2),
+                      delta * (ad - 0.5 * delta)).sum(-1)  # (B, T, 2, 20)
+    w = valid.to(hub.dtype)
+    n = w.sum().clamp(min=1.0)
+    loss = (hub * w).sum() / n
+    with torch.no_grad():
+        rad = ((d.pow(2).sum(-1).sqrt() * w).sum() / n)
+    return loss, {"reproj_rad": rad}
+
+
 def uvd_wrist_loss(pred_x0: torch.Tensor, target_x0: torch.Tensor,
                    K: torch.Tensor, mask: torch.Tensor | None = None,
                    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
@@ -503,5 +586,42 @@ if __name__ == "__main__":
     loss_masked = flow_match_loss(torch.randn(4, 10), torch.zeros(4, 10), mask=torch.zeros(4))
     assert loss_masked.item() < 1e-6, f"mask 0 should zero the loss, got {loss_masked}"
     print(f"mask=0 zeros loss OK: {loss_masked.item():.2e}")
+
+    # reprojection_loss: identity -> 0; known lateral offset -> known angle;
+    # behind-camera GT excluded; pred z<=0 finite (clamp).
+    x = torch.zeros(2, 121, 138)
+    x[..., 2] = 0.45; x[..., 5] = 0.45          # both wrists at z=0.45 m
+    l0, d0 = reprojection_loss(x, x)
+    assert l0.item() < 1e-9, f"identity reproj should be 0, got {l0}"
+    y = x.clone(); y[..., 0] += 0.009           # left wrist +9 mm lateral
+    l1, d1 = reprojection_loss(y, x)
+    th = 0.009 / 0.45                           # = 0.02 rad, inside Huber knee
+    # offset moves ALL left-hand joints (integrate adds wrist to offsets)
+    exp = 0.5 * th * th * 0.5                   # half the cells (left hand only)
+    assert abs(l1.item() - exp) / exp < 0.05, f"expected ~{exp:.2e}, got {l1.item():.2e}"
+    assert abs(d1["reproj_rad"].item() - th * 0.5) / (th * 0.5) < 0.05
+    z = x.clone(); z[..., 5] = -1.0             # right wrist behind camera
+    l2, d2 = reprojection_loss(y, z)            # right cells must be excluded
+    assert torch.isfinite(l2), "behind-camera GT must not produce inf/nan"
+    p = y.clone(); p[..., 2] = -2.0             # PRED z behind camera
+    l3, _ = reprojection_loss(p, x)
+    assert torch.isfinite(l3), "pred z<0 must be clamped, not divide"
+    fv = torch.zeros(2, 121, 2, dtype=torch.bool)
+    l4, _ = reprojection_loss(y, x, frame_valid=fv)
+    assert l4.item() == 0.0, "all-invalid frame_valid must zero the loss"
+    print(f"reprojection_loss OK: identity={l0:.1e}, 9mm@0.45m={l1.item():.2e} "
+          f"(exp {exp:.2e}), rad={d1['reproj_rad'].item():.4f}")
+
+    # pixel mode: same 9mm@0.45m offset through fx=500 -> 10px, knee 2.5px
+    # -> per-x-component huber = 2.5*(10-1.25); y=0; left hand only.
+    foc = torch.full((2, 2), 500.0)
+    lp, dp = reprojection_loss(y, x, focal_px=foc, delta=2.5)
+    expp = 2.5 * (10.0 - 1.25) * 0.5
+    assert abs(lp.item() - expp) / expp < 0.05, f"expected ~{expp:.3f}, got {lp.item():.3f}"
+    # anisotropic focal: doubling fy must not change a pure-x residual
+    foc2 = torch.stack([torch.full((2,), 500.0), torch.full((2,), 1000.0)], 1)
+    lp2, _ = reprojection_loss(y, x, focal_px=foc2, delta=2.5)
+    assert abs(lp2.item() - lp.item()) < 1e-6, "fy must not affect x residual"
+    print(f"reprojection_loss PIXEL OK: 10px@fx500={lp.item():.3f} (exp {expp:.3f})")
 
     print("all losses tests pass")

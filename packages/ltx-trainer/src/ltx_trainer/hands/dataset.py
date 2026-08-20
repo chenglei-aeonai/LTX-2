@@ -206,16 +206,22 @@ class HandsLTXDataset(Dataset):
         skel_raw, chan_valid = encode_v2_from_anno(anno, abs_rot=True,
                                                    anchor_pos=True)
         skel = whiten(skel_raw, self.stats)
+        # per-clip focal at TRAIN resolution: anno["K"] is stored at the
+        # 832x480 decode/render geometry (the overlay draws with it raw),
+        # so fx, fy are already in training pixels. Used by the pixel-space
+        # reprojection loss; harmless extra field otherwise.
+        K = np.asarray(anno["K"])
+        focal_px = torch.tensor([float(K[0, 0]), float(K[1, 1])])
         return {"video_tokens": tokens, "grid": (F, H, W),
                 "context": ctx.float(), "context_mask": mask,
                 "skel": skel, "skel_raw": skel_raw, "chan_valid": chan_valid,
-                "corpus": c, "clip_id": cid}
+                "focal_px": focal_px, "corpus": c, "clip_id": cid}
 
 
 def collate(batch: list[dict]) -> dict:
     out = {}
     for k in ("video_tokens", "context", "context_mask", "skel", "skel_raw",
-              "chan_valid"):
+              "chan_valid", "focal_px"):
         out[k] = torch.stack([b[k] for b in batch])
     out["grid"] = batch[0]["grid"]
     out["clip_id"] = [b["clip_id"] for b in batch]
